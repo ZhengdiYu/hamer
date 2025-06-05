@@ -46,6 +46,7 @@ class MANOTransformerDecoderHead(nn.Module):
             nn.init.xavier_uniform_(self.decshape.weight, gain=0.01)
             nn.init.xavier_uniform_(self.deccam.weight, gain=0.01)
 
+        print(cfg.MANO.MEAN_PARAMS, cfg.MANO)
         mean_params = np.load(cfg.MANO.MEAN_PARAMS)
         init_hand_pose = torch.from_numpy(mean_params['pose'].astype(np.float32)).unsqueeze(0)
         init_betas = torch.from_numpy(mean_params['shape'].astype('float32')).unsqueeze(0)

@@ -20,13 +20,14 @@ class ViTDetDataset(torch.utils.data.Dataset):
                  img_cv2: np.array,
                  boxes: np.array,
                  right: np.array,
+                 vit_keypoints: np.array,
                  rescale_factor=2.5,
                  train: bool = False,
                  **kwargs):
         super().__init__()
         self.cfg = cfg
         self.img_cv2 = img_cv2
-        # self.boxes = boxes
+        self.boxes = boxes
 
         assert train == False, "ViTDetDataset is only for inference"
         self.train = train
@@ -40,6 +41,8 @@ class ViTDetDataset(torch.utils.data.Dataset):
         self.scale = rescale_factor * (boxes[:, 2:4] - boxes[:, 0:2]) / 200.0
         self.personid = np.arange(len(boxes), dtype=np.int32)
         self.right = right.astype(np.float32)
+        self.vit_keypoints = vit_keypoints.astype(np.float32)
+        self.height, self.weight = boxes[:, 3]-boxes[:, 1], boxes[:, 2]-boxes[:, 0]
 
     def __len__(self) -> int:
         return len(self.personid)
@@ -53,6 +56,7 @@ class ViTDetDataset(torch.utils.data.Dataset):
         scale = self.scale[idx]
         BBOX_SHAPE = self.cfg.MODEL.get('BBOX_SHAPE', None)
         bbox_size = expand_to_aspect_ratio(scale*200, target_aspect_ratio=BBOX_SHAPE).max()
+        # print('bbox_size/scale: ', bbox_size, '...', scale)
 
         patch_width = patch_height = self.img_size
 
@@ -65,13 +69,13 @@ class ViTDetDataset(torch.utils.data.Dataset):
         if True:
             # Blur image to avoid aliasing artifacts
             downsampling_factor = ((bbox_size*1.0) / patch_width)
-            print(f'{downsampling_factor=}')
+            # print(f'{downsampling_factor=}')
             downsampling_factor = downsampling_factor / 2.0
             if downsampling_factor > 1.1:
                 cvimg  = gaussian(cvimg, sigma=(downsampling_factor-1)/2, channel_axis=2, preserve_range=True)
 
 
-        img_patch_cv, trans = generate_image_patch_cv2(cvimg,
+        img_patch_cv, trans, inv_trans = generate_image_patch_cv2(cvimg,
                                                     center_x, center_y,
                                                     bbox_size, bbox_size,
                                                     patch_width, patch_height,
@@ -88,8 +92,13 @@ class ViTDetDataset(torch.utils.data.Dataset):
             'img': img_patch,
             'personid': int(self.personid[idx]),
         }
+        item['img_patch'] = img_patch_cv.copy()
         item['box_center'] = self.center[idx].copy()
         item['box_size'] = bbox_size
         item['img_size'] = 1.0 * np.array([cvimg.shape[1], cvimg.shape[0]])
         item['right'] = self.right[idx].copy()
+        item['2d'] = self.vit_keypoints[idx].copy()
+        item['inv_trans'] = inv_trans.copy()
+        item['bbox'] = np.array([center[0], center[1], bbox_size, bbox_size])
+        # print(item['bbox'], item['img_patch'].shape)
         return item

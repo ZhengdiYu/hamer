@@ -24,6 +24,7 @@ class MANO(smplx.MANOLayer):
             self.register_buffer('joint_regressor_extra', torch.tensor(pickle.load(open(joint_regressor_extra, 'rb'), encoding='latin1'), dtype=torch.float32))
         self.register_buffer('extra_joints_idxs', to_tensor(list(vertex_ids['mano'].values()), dtype=torch.long))
         self.register_buffer('joint_map', torch.tensor(mano_to_openpose, dtype=torch.long))
+        self.pose2rot = kwargs.get('pose2rot')
 
     def forward(self, *args, **kwargs) -> MANOOutput:
         """

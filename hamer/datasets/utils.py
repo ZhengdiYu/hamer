@@ -81,7 +81,7 @@ def rotate_2d(pt_2d: np.array, rot_rad: float) -> np.array:
 def gen_trans_from_patch_cv(c_x: float, c_y: float,
                             src_width: float, src_height: float,
                             dst_width: float, dst_height: float,
-                            scale: float, rot: float) -> np.array:
+                            scale: float, rot: float, inv: bool) -> np.array:
     """
     Create transformation matrix for the bounding box crop.
     Args:
@@ -123,7 +123,10 @@ def gen_trans_from_patch_cv(c_x: float, c_y: float,
     dst[1, :] = dst_center + dst_downdir
     dst[2, :] = dst_center + dst_rightdir
 
-    trans = cv2.getAffineTransform(np.float32(src), np.float32(dst))
+    if inv:
+        trans = cv2.getAffineTransform(np.float32(dst), np.float32(src))
+    else:
+        trans = cv2.getAffineTransform(np.float32(src), np.float32(dst))
 
     return trans
 
@@ -186,7 +189,7 @@ def crop_img(img, ul, br, border_mode=cv2.BORDER_CONSTANT, border_value=0):
     c_y = (ul[1] + br[1])/2
     bb_width = patch_width = br[0] - ul[0]
     bb_height = patch_height = br[1] - ul[1]
-    trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, 1.0, 0)
+    trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, 1.0, 0, inv=False)
     img_patch = cv2.warpAffine(img, trans, (int(patch_width), int(patch_height)), 
                                 flags=cv2.INTER_LINEAR, 
                                 borderMode=border_mode,
@@ -230,7 +233,7 @@ def generate_image_patch_skimage(img: np.array, c_x: float, c_y: float,
        img = img[:, ::-1, :]
        c_x = img_width - c_x - 1
 
-    trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, scale, rot)
+    trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, scale, rot,  inv=False)
 
     #img_patch = cv2.warpAffine(img, trans, (int(patch_width), int(patch_height)), flags=cv2.INTER_LINEAR)
 
@@ -342,14 +345,14 @@ def generate_image_patch_cv2(img: np.array, c_x: float, c_y: float,
         img = img[:, ::-1, :]
         c_x = img_width - c_x - 1
 
-
-    trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, scale, rot)
-
+    trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, scale, rot, inv=False)
     img_patch = cv2.warpAffine(img, trans, (int(patch_width), int(patch_height)), 
                         flags=cv2.INTER_LINEAR, 
                         borderMode=border_mode,
                         borderValue=border_value,
                 )
+    inv_trans = gen_trans_from_patch_cv(c_x, c_y, bb_width, bb_height, patch_width, patch_height, scale, rot, inv=True)
+
     # Force borderValue=cv2.BORDER_CONSTANT for alpha channel
     if (img.shape[2] == 4) and (border_mode != cv2.BORDER_CONSTANT):
         img_patch[:,:,3] = cv2.warpAffine(img[:,:,3], trans, (int(patch_width), int(patch_height)), 
@@ -357,7 +360,7 @@ def generate_image_patch_cv2(img: np.array, c_x: float, c_y: float,
                                             borderMode=cv2.BORDER_CONSTANT,
                             )
 
-    return img_patch, trans
+    return img_patch, trans, inv_trans
 
 
 def convert_cvimg_to_tensor(cvimg: np.array):

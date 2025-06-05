@@ -245,7 +245,9 @@ class Renderer:
             output_img = color[:, :, :3]
 
         output_img = output_img.astype(np.float32)
-        return output_img
+        print('render.py', rend_depth.shape)
+        raise ValueError
+        return output_img, rend_depth.astype(np.float32)
 
     def vertices_to_trimesh(self, vertices, camera_translation, mesh_base_color=(1.0, 1.0, 0.9), 
                             rot_axis=[1,0,0], rot_angle=0, is_right=1):
@@ -254,6 +256,7 @@ class Renderer:
         #     alphaMode='OPAQUE',
         #     baseColorFactor=(*mesh_base_color, 1.0))
         vertex_colors = np.array([(*mesh_base_color, 1.0)] * vertices.shape[0])
+        # print(vertices.shape, self.faces.shape)
         if is_right:
             mesh = trimesh.Trimesh(vertices.copy() + camera_translation, self.faces.copy(), vertex_colors=vertex_colors)
         else:
@@ -383,7 +386,7 @@ class Renderer:
         color = color.astype(np.float32) / 255.0
         renderer.delete()
 
-        return color
+        return color, rend_depth.astype(np.float32)
 
     def add_lighting(self, scene, cam_node, color=np.ones(3), intensity=1.0):
         # from phalp.visualize.py_renderer import get_light_poses

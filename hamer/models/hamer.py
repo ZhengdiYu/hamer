@@ -31,9 +31,9 @@ class HAMER(pl.LightningModule):
         self.cfg = cfg
         # Create backbone feature extractor
         self.backbone = create_backbone(cfg)
-        if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
-            log.info(f'Loading backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
-            self.backbone.load_state_dict(torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict'])
+        #if cfg.MODEL.BACKBONE.get('PRETRAINED_WEIGHTS', None):
+        #    log.info(f'Loading backbone weights from {cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS}')
+        #    self.backbone.load_state_dict(torch.load(cfg.MODEL.BACKBONE.PRETRAINED_WEIGHTS, map_location='cpu')['state_dict'])
 
         # Create MANO head
         self.mano_head = build_mano_head(cfg)
@@ -49,7 +49,10 @@ class HAMER(pl.LightningModule):
 
         # Instantiate MANO model
         mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
-        self.mano = MANO(**mano_cfg)
+        print('!!!!!!!!!!', mano_cfg)
+
+        self.mano = MANO(pose2rot=False, **mano_cfg)
+        print(self.mano)
 
         # Buffer that shows whetheer we need to initialize ActNorm layers
         self.register_buffer('initialized', torch.tensor(False))
@@ -63,6 +66,12 @@ class HAMER(pl.LightningModule):
 
         # Disable automatic optimization since we use adversarial training
         self.automatic_optimization = False
+
+    def on_after_backward(self):
+        for name, param in self.named_parameters():
+            if param.grad is None:
+                print(param.shape)
+                print(name)
 
     def get_parameters(self):
         all_params = list(self.mano_head.parameters())
@@ -125,6 +134,7 @@ class HAMER(pl.LightningModule):
         pred_mano_params['global_orient'] = pred_mano_params['global_orient'].reshape(batch_size, -1, 3, 3)
         pred_mano_params['hand_pose'] = pred_mano_params['hand_pose'].reshape(batch_size, -1, 3, 3)
         pred_mano_params['betas'] = pred_mano_params['betas'].reshape(batch_size, -1)
+        
         mano_output = self.mano(**{k: v.float() for k,v in pred_mano_params.items()}, pose2rot=False)
         pred_keypoints_3d = mano_output.joints
         pred_vertices = mano_output.vertices
@@ -135,8 +145,19 @@ class HAMER(pl.LightningModule):
         pred_keypoints_2d = perspective_projection(pred_keypoints_3d,
                                                    translation=pred_cam_t,
                                                    focal_length=focal_length / self.cfg.MODEL.IMAGE_SIZE)
-
+        # print('focal_length: ', focal_length , self.cfg.MODEL.IMAGE_SIZE)
         output['pred_keypoints_2d'] = pred_keypoints_2d.reshape(batch_size, -1, 2)
+
+        output['pred_mano_params'] = pred_mano_params
+        mano_param = []
+        for i in range(len(output['pred_mano_params']['global_orient'])):
+            tmp = {}
+            tmp['global_orient'] = output['pred_mano_params']['global_orient'][i].detach().cpu().numpy()
+            tmp['hand_pose'] = output['pred_mano_params']['hand_pose'][i].detach().cpu().numpy()
+            tmp['betas'] = output['pred_mano_params']['betas'][i].detach().cpu().numpy()
+            mano_param.append(tmp)
+        output['pred_mano_params'] = mano_param
+
         return output
 
     def compute_loss(self, batch: Dict, output: Dict, train: bool = True) -> torch.Tensor:
@@ -182,6 +203,8 @@ class HAMER(pl.LightningModule):
         loss = self.cfg.LOSS_WEIGHTS['KEYPOINTS_3D'] * loss_keypoints_3d+\
                self.cfg.LOSS_WEIGHTS['KEYPOINTS_2D'] * loss_keypoints_2d+\
                sum([loss_mano_params[k] * self.cfg.LOSS_WEIGHTS[k.upper()] for k in loss_mano_params])
+
+        #loss = loss + 0*self.mano.body_pose.mean()
 
         losses = dict(loss=loss.detach(),
                       loss_keypoints_2d=loss_keypoints_2d.detach(),
