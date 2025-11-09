@@ -54,6 +54,326 @@ gt_indices = openpose_indices
 
 hand_history = {"left": None, "right": None}
 MAX_MOVEMENT = 30  # Maximum allowed pixel movement for hands between frames
+handedness_history = []  # Track handedness over time to detect flips
+
+def compute_bbox_from_keypoints(keypoints, img_shape, scale_factor=1.2, max_size_ratio=0.4):
+    """
+    Compute a tight bounding box from hand keypoints with size constraints.
+    
+    Args:
+        keypoints: (21, 3) array of hand keypoints [x, y, conf]
+        img_shape: (H, W) image dimensions
+        scale_factor: How much to expand bbox beyond keypoints (default 1.2 = 20% padding)
+        max_size_ratio: Maximum bbox size as ratio of image size (default 0.4 = 40%)
+    
+    Returns:
+        bbox: [x_min, y_min, x_max, y_max] format (what ViTDetDataset expects)
+    """
+    valid = keypoints[:, 2] > 0.3
+    if valid.sum() < 3:
+        return None
+    
+    valid_kp = keypoints[valid, :2]
+    
+    # Get min/max coordinates
+    x_min, y_min = valid_kp.min(axis=0)
+    x_max, y_max = valid_kp.max(axis=0)
+    
+    # Compute size
+    width = x_max - x_min
+    height = y_max - y_min
+    
+    # Compute center
+    cx = (x_min + x_max) / 2
+    cy = (y_min + y_max) / 2
+    
+    # Add padding
+    width *= scale_factor
+    height *= scale_factor
+    
+    # Enforce maximum size (prevent huge boxes)
+    img_h, img_w = img_shape[:2]
+    max_width = img_w * max_size_ratio
+    max_height = img_h * max_size_ratio
+    
+    if width > max_width:
+        print(f"WARNING: Bbox width {width:.0f} exceeds max {max_width:.0f}, clamping")
+        width = max_width
+    if height > max_height:
+        print(f"WARNING: Bbox height {height:.0f} exceeds max {max_height:.0f}, clamping")
+        height = max_height
+    
+    # Make bbox square (use max of width/height)
+    size = max(width, height)
+    
+    # Compute new min/max with padding and size constraints
+    new_x_min = cx - size / 2
+    new_y_min = cy - size / 2
+    new_x_max = cx + size / 2
+    new_y_max = cy + size / 2
+    
+    # Return in [x_min, y_min, x_max, y_max] format (what ViTDetDataset expects)
+    return [new_x_min, new_y_min, new_x_max, new_y_max]
+
+def compute_iou(bbox1, bbox2):
+    """
+    Compute IoU (Intersection over Union) between two bboxes
+    bbox format: [x_min, y_min, x_max, y_max]
+    """
+    x1_min, y1_min, x1_max, y1_max = bbox1
+    x2_min, y2_min, x2_max, y2_max = bbox2
+    
+    # Compute intersection
+    x_inter_min = max(x1_min, x2_min)
+    y_inter_min = max(y1_min, y2_min)
+    x_inter_max = min(x1_max, x2_max)
+    y_inter_max = min(y1_max, y2_max)
+    
+    if x_inter_max < x_inter_min or y_inter_max < y_inter_min:
+        return 0.0
+    
+    inter_area = (x_inter_max - x_inter_min) * (y_inter_max - y_inter_min)
+    bbox1_area = (x1_max - x1_min) * (y1_max - y1_min)
+    bbox2_area = (x2_max - x2_min) * (y2_max - y2_min)
+    
+    iou = inter_area / (bbox1_area + bbox2_area - inter_area)
+    return iou
+
+def check_bbox_jump(bboxes, is_right, keypoints, last_bbox_dict, img_width, iou_threshold=0.5):
+    """
+    Detect sudden bbox jumps using IoU (Intersection over Union) with the last frame's bbox.
+    If IoU is too low, replace current bbox with last frame's bbox to prevent wrong interpolation.
+    
+    :param bboxes: list of [x_min, y_min, x_max, y_max]
+    :param is_right: list of hand IDs (0=left, 1=right)
+    :param keypoints: list of keypoints
+    :param last_bbox_dict: dict {hand_id: [x_min, y_min, x_max, y_max]} of last good bboxes
+    :param img_width: image width (unused, kept for compatibility)
+    :param iou_threshold: IoU threshold below which bbox is considered a jump (e.g., 0.5)
+    :return: corrected bboxes, updated last_bbox_dict
+    """
+    corrected_bboxes = []
+    jump_detected = {}
+    
+    for i, (bbox, hand_id) in enumerate(zip(bboxes, is_right)):
+        # Check if we have history for this hand
+        if last_bbox_dict[hand_id] is not None:
+            last_bbox = last_bbox_dict[hand_id]
+            
+            # Calculate IoU with last frame's bbox
+            iou = compute_iou(bbox, last_bbox)
+            
+            # If IoU is too low, there's a jump - use last bbox
+            if iou < iou_threshold:
+                print(f"  ⚠ BBOX JUMP DETECTED for hand {hand_id} ({'right' if hand_id else 'left'}): "
+                      f"IoU={iou:.3f} (threshold={iou_threshold})")
+                print(f"    Last bbox: [{last_bbox[0]:.0f}, {last_bbox[1]:.0f}, {last_bbox[2]:.0f}, {last_bbox[3]:.0f}]")
+                print(f"    New bbox:  [{bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f}]")
+                print(f"    → Replacing with last frame's bbox")
+                
+                # Use last frame's bbox instead
+                corrected_bboxes.append(last_bbox)
+                jump_detected[hand_id] = True
+                # Don't update last_bbox_dict - keep the good one
+            else:
+                # No jump, use current bbox and update history
+                corrected_bboxes.append(bbox)
+                last_bbox_dict[hand_id] = bbox
+                jump_detected[hand_id] = False
+        else:
+            # First detection, just store it
+            corrected_bboxes.append(bbox)
+            last_bbox_dict[hand_id] = bbox
+            jump_detected[hand_id] = False
+    
+    return corrected_bboxes, jump_detected
+
+
+def check_bbox_overlap(bboxes, right, vit_keypoints, iou_threshold=0.3):
+    """
+    Check if detected left and right hands overlap significantly.
+    If they do, keep only the one with higher confidence.
+    """
+    if len(bboxes) != 2:
+        return bboxes, right, vit_keypoints
+    
+    # Check if we have both left (0) and right (1)
+    if not (0 in right and 1 in right):
+        return bboxes, right, vit_keypoints
+    
+    left_idx = np.where(right == 0)[0][0]
+    right_idx = np.where(right == 1)[0][0]
+    
+    iou = compute_iou(bboxes[left_idx], bboxes[right_idx])
+    
+    if iou > iou_threshold:
+        print(f"WARNING: High overlap detected (IoU={iou:.3f}), keeping higher confidence hand")
+        
+        # Compute confidence for each hand
+        left_conf = np.mean(vit_keypoints[left_idx][:, 2])
+        right_conf = np.mean(vit_keypoints[right_idx][:, 2])
+        
+        # Keep the hand with higher confidence
+        if left_conf > right_conf:
+            return bboxes[[left_idx]], right[[left_idx]], vit_keypoints[[left_idx]]
+        else:
+            return bboxes[[right_idx]], right[[right_idx]], vit_keypoints[[right_idx]]
+    
+    return bboxes, right, vit_keypoints
+
+def check_handedness_consistency(bboxes, right, vit_keypoints, history_window=5):
+    """
+    Check for sudden handedness flips by comparing spatial location with previous frames.
+    If a hand suddenly changes handedness but stays in the same spatial location, it's likely a flip.
+    
+    Args:
+        bboxes: (N, 4) array of bounding boxes
+        right: (N,) array of handedness (0=left, 1=right)
+        vit_keypoints: (N, 21, 3) array of keypoints
+        history_window: number of previous frames to check
+    
+    Returns:
+        Corrected bboxes, right, vit_keypoints
+    """
+    global handedness_history
+    
+    if len(bboxes) == 0:
+        return bboxes, right, vit_keypoints
+    
+    # SPECIAL CASE: Two hands at same location with different handedness
+    # This is almost always a hallucination where one has wrong handedness
+    if len(bboxes) == 2 and right[0] != right[1]:
+        # Check if they're at the same location
+        center_0 = (bboxes[0][:2] + bboxes[0][2:4]) / 2
+        center_1 = (bboxes[1][:2] + bboxes[1][2:4]) / 2
+        dist = np.linalg.norm(center_0 - center_1)
+        
+        if dist < 50:  # Very close together (likely same hand)
+            print(f"WARNING: Two hands detected at same location (dist={dist:.1f}px) with different handedness!")
+            
+            # Check history to see which handedness is correct
+            if len(handedness_history) >= 1:
+                # Look at previous frame to see which handedness was there
+                prev_frame = handedness_history[-1]
+                
+                # Find which hand in previous frame is closest to this location
+                avg_center = (center_0 + center_1) / 2
+                min_dist = float('inf')
+                prev_handedness = None
+                
+                for prev_hand in prev_frame:
+                    d = np.linalg.norm(avg_center - prev_hand['center'])
+                    if d < min_dist:
+                        min_dist = d
+                        prev_handedness = prev_hand['handedness']
+                
+                if prev_handedness is not None and min_dist < 100:
+                    # Keep the hand that matches previous frame's handedness
+                    print(f"Previous frame had {'right' if prev_handedness else 'left'} hand at this location. "
+                          f"Keeping only that handedness.")
+                    
+                    if right[0] == prev_handedness:
+                        # Keep hand 0
+                        return bboxes[[0]], right[[0]], vit_keypoints[[0]]
+                    else:
+                        # Keep hand 1
+                        return bboxes[[1]], right[[1]], vit_keypoints[[1]]
+            
+            # No history or couldn't determine - keep higher confidence one
+            print("No clear history, keeping higher confidence hand")
+            conf_0 = np.mean(vit_keypoints[0][:, 2])
+            conf_1 = np.mean(vit_keypoints[1][:, 2])
+            if conf_0 > conf_1:
+                return bboxes[[0]], right[[0]], vit_keypoints[[0]]
+            else:
+                return bboxes[[1]], right[[1]], vit_keypoints[[1]]
+    
+    # Store current frame info
+    current_frame = []
+    for i in range(len(bboxes)):
+        bbox_center = (bboxes[i][:2] + bboxes[i][2:4]) / 2
+        current_frame.append({
+            'bbox': bboxes[i],
+            'center': bbox_center,
+            'handedness': right[i],
+            'keypoints': vit_keypoints[i]
+        })
+    
+    # Check against history if we have enough frames
+    if len(handedness_history) >= 2:
+        corrected_right = right.copy()
+        
+        for i, curr_hand in enumerate(current_frame):
+            curr_center = curr_hand['center']
+            curr_handedness = curr_hand['handedness']
+            
+            # Look for this hand in previous frames based on spatial proximity
+            votes = []  # Collect handedness votes from previous frames
+            
+            for prev_frame in handedness_history[-history_window:]:
+                # Find closest hand in previous frame
+                min_dist = float('inf')
+                closest_handedness = None
+                
+                for prev_hand in prev_frame:
+                    dist = np.linalg.norm(curr_center - prev_hand['center'])
+                    if dist < min_dist and dist < 100:  # Within 100 pixels
+                        min_dist = dist
+                        closest_handedness = prev_hand['handedness']
+                
+                if closest_handedness is not None:
+                    votes.append(closest_handedness)
+            
+            # If we have enough votes and they disagree with current detection
+            if len(votes) >= 2:
+                majority_vote = int(np.median(votes))
+                if majority_vote != curr_handedness:
+                    print(f"WARNING: Handedness flip detected! "
+                          f"Current: {'right' if curr_handedness else 'left'}, "
+                          f"History: {'right' if majority_vote else 'left'} "
+                          f"(votes: {votes}). Correcting...")
+                    corrected_right[i] = majority_vote
+        
+        # If handedness was corrected, update
+        if not np.array_equal(corrected_right, right):
+            right = corrected_right
+            
+            # Check if we now have duplicate handedness (both left or both right)
+            # This happens when a hallucination was misclassified with wrong handedness
+            if len(right) == 2 and right[0] == right[1]:
+                print(f"WARNING: After handedness correction, both hands are {'right' if right[0] else 'left'}. "
+                      f"This is likely a hallucination. Keeping only the one with higher confidence.")
+                # Keep the one with higher average keypoint confidence
+                conf_0 = np.mean(vit_keypoints[0][:, 2])
+                conf_1 = np.mean(vit_keypoints[1][:, 2])
+                if conf_0 > conf_1:
+                    bboxes = bboxes[[0]]
+                    right = right[[0]]
+                    vit_keypoints = vit_keypoints[[0]]
+                else:
+                    bboxes = bboxes[[1]]
+                    right = right[[1]]
+                    vit_keypoints = vit_keypoints[[1]]
+    
+    # Update history with corrected handedness for next frame
+    current_frame_corrected = []
+    for i in range(len(bboxes)):
+        bbox_center = (bboxes[i][:2] + bboxes[i][2:4]) / 2
+        current_frame_corrected.append({
+            'bbox': bboxes[i],
+            'center': bbox_center,
+            'handedness': right[i],
+            'keypoints': vit_keypoints[i]
+        })
+    
+    # Add current frame to history
+    handedness_history.append(current_frame_corrected)
+    
+    # Keep only recent history
+    if len(handedness_history) > history_window:
+        handedness_history.pop(0)
+    
+    return bboxes, right, vit_keypoints
 
 def restrict_hand_movement(bboxes, right, vit_keypoints):
     global hand_history
@@ -87,12 +407,6 @@ def restrict_hand_movement(bboxes, right, vit_keypoints):
         movement = np.linalg.norm(prev_right_bbox[:2] - right_hand[:2])
         if movement > MAX_MOVEMENT:
             right_hand, right_hand_kp = prev_right_bbox, prev_right_kp  # Use last frame's data
-    
-    # Ensure left hand is in front
-    if left_hand is not None and right_hand is not None:
-        if left_hand[2] < right_hand[2]:  # Compare depths
-            left_hand, right_hand = right_hand, left_hand
-            left_hand_kp, right_hand_kp = right_hand_kp, left_hand_kp
     
     # Update history
     hand_history["left"] = (left_hand, left_hand_kp)
@@ -398,7 +712,7 @@ def main():
     parser.add_argument('--full_frame', dest='full_frame', action='store_true', default=True, help='If set, render all people together also')
     parser.add_argument('--save_mesh', dest='save_mesh', action='store_true', default=False, help='If set, save meshes to disk also')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference/fitting')
-    parser.add_argument('--rescale_factor', type=float, default=2.0, help='Factor for padding the bbox')
+    parser.add_argument('--rescale_factor', type=float, default=1.3, help='Factor for padding the bbox')
     parser.add_argument('--file_type', nargs='+', default=['*.jpg', '*.png'], help='List of file extensions to consider')
     parser.add_argument('--conf', type=float, default=2.0, help='Factor for padding the bbox')
     parser.add_argument('--type', type=str, default='EgoDexter', help='Path to pretrained model checkpoint')
@@ -465,17 +779,14 @@ def main():
     tid = []
     x= 0
     tracked_time = [0,0]
+    
+    # Track bbox history to detect sudden jumps using IoU
+    last_bbox_dict = {0: None, 1: None}  # {hand_id: [x_min, y_min, x_max, y_max]}
 
     for img_path in tqdm(sorted(img_paths)):
         a = time.time()
         img_path = str(img_path)
         img_cv2 = cv2.imread(str(img_path))
-        # if 'c5_' not in img_path:
-        #     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-        #     img_cv2 = cv2.imread(str(img_path))
-        # else:
-        #     print("?????????????????????????????????????????????????????????????????????????????????????????????????????????????????")
-        #     img_cv2 = cv2.cvtColor(cv2.imread(str(img_path)), cv2.COLOR_RGB2BGR)
 
         results_dict[img_path] = {}
         results_dict[img_path]['mano'] = []
@@ -483,8 +794,6 @@ def main():
         results_dict[img_path]['tracked_ids'] = []
         results_dict[img_path]['tracked_time'] = []
         results_dict[img_path]['extra_data'] = []
-        # if '000009' not in str(img_path) and '000008' not in str(img_path):
-        #     continue
 
         # Detect humans in image
         det_out = detector(img_cv2)
@@ -494,9 +803,6 @@ def main():
         valid_idx = (det_instances.pred_classes==0) & (det_instances.scores > 0.5)
         pred_bboxes=det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
         pred_scores=det_instances.scores[valid_idx].cpu().numpy()
-        # print(det_out.keys())
-        # print(';******************')
-        # print(det_instances)
 
         # Detect human keypoints for each person
         vitposes_out = cpm.predict_pose(
@@ -594,11 +900,14 @@ def main():
 
             # Rejecting not confident detections
             keyp = left_hand_keyp
-            valid = keyp[:,2] > 0.5
+            valid = keyp[:,2] > 0.3
+            print("left valid: ", valid, sum(valid), np.mean(keyp[:,2]), last_left_conf)
             if sum(valid) > 10:
                 if 0 not in is_right:
                     print('append left')
-                    bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
+                    bbox = compute_bbox_from_keypoints(keyp, img_cv2.shape, scale_factor=1.5, max_size_ratio=0.4)
+                    if bbox is None:
+                        continue
                     # bboxes.append(bbox)
                     is_right.append(0)
                     # vit_keypoints_list.append(keyp)
@@ -610,16 +919,21 @@ def main():
                     if np.mean(keyp[:,2]) > last_left_conf:
                         print('exchange!!!!!: ', np.mean(keyp[:,2]), last_left_conf)
                         # raise ValueError
-                        last_left_conf = np.mean(keyp[:,2])
-                        l_bbox = bbox
-                        l_keyp = keyp
+                        bbox = compute_bbox_from_keypoints(keyp, img_cv2.shape, scale_factor=1.5, max_size_ratio=0.4)
+                        if bbox is not None:
+                            last_left_conf = np.mean(keyp[:,2])
+                            l_bbox = bbox
+                            l_keyp = keyp
 
             keyp = right_hand_keyp
-            valid = keyp[:,2] > 0.5
+            valid = keyp[:,2] > 0.3
+            print("right valid: ", valid, sum(valid),np.mean(keyp[:,2]), last_right_conf)
             if sum(valid) > 10:
                 if 1 not in is_right:
                     print('append right')
-                    bbox = [keyp[valid,0].min(), keyp[valid,1].min(), keyp[valid,0].max(), keyp[valid,1].max()]
+                    bbox = compute_bbox_from_keypoints(keyp, img_cv2.shape, scale_factor=1.5, max_size_ratio=0.4)
+                    if bbox is None:
+                        continue
                     # bboxes.append(bbox)
                     is_right.append(1)
                     # vit_keypoints_list.append(keyp)
@@ -631,9 +945,11 @@ def main():
                     if np.mean(keyp[:,2]) > last_right_conf:
                         print('exchange!!!!!: ', np.mean(keyp[:,2]), last_right_conf)
                         # raise ValueError
-                        last_right_conf = np.mean(keyp[:,2])
-                        r_bbox = bbox
-                        r_keyp = keyp
+                        bbox = compute_bbox_from_keypoints(keyp, img_cv2.shape, scale_factor=1.5, max_size_ratio=0.4)
+                        if bbox is not None:
+                            last_right_conf = np.mean(keyp[:,2])
+                            r_bbox = bbox
+                            r_keyp = keyp
 
         is_right = []
         if l_flag:
@@ -658,6 +974,11 @@ def main():
                 if i > 50 and (idx in tid):
                     tid.remove(idx)
             print('no hand detected!!!', results_dict[img_path]['tid'], results_dict[img_path]['tracked_ids'], results_dict[img_path]['tracked_time'])
+            if args.render:
+                print('save no hand detected image')
+                cv2.imwrite(os.path.join(render_save_path, f'{img_fn}.jpg'), img_cv2.astype(np.float32))
+                cv2.imwrite(os.path.join(joint2d_save_path, f'{img_fn}.jpg'), img_cv2.astype(np.float32))
+                cv2.imwrite(os.path.join(vit_save_path, f'{img_fn}.jpg'), img_cv2.astype(np.float32))
             continue
 
         if len(bboxes) > 0:
@@ -671,29 +992,82 @@ def main():
             print('right: ', right)
             vit_keypoints = vit_keypoints[sort_idx][:2]
             boxes = boxes[sort_idx][:2]
+            
+            print(f"Before handedness check: {len(boxes)} hands, handedness: {right}")
+            
+            # Visualize bboxes before any filtering
+            img_debug = img_cv2.copy()
+            for i, bbox in enumerate(boxes):
+                x1, y1, x2, y2 = bbox
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                color = (0, 255, 0) if right[i] == 1 else (255, 0, 0)  # Green=right, Blue=left
+                cv2.rectangle(img_debug, (x1, y1), (x2, y2), color, 3)
+                label = f"{'R' if right[i] == 1 else 'L'}"
+                cv2.putText(img_debug, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+            cv2.imwrite(os.path.join(render_save_path, f'{img_fn}_bbox_before.jpg'), img_debug)
+            
+            # DISABLE handedness check for now to debug
+            # Check for handedness flips FIRST (temporal consistency)
+            # This must run before overlap check to ensure we keep the correct handedness
+            # boxes, right, vit_keypoints = check_handedness_consistency(boxes, right, vit_keypoints, history_window=5)
+            
+            print(f"After handedness check (DISABLED): {len(boxes)} hands, handedness: {right}")
+            
+            # Check for overlapping hands (hallucination detection) FIRST
+            # Remove duplicates before any tracking
+            boxes, right, vit_keypoints = check_bbox_overlap(boxes, right, vit_keypoints, iou_threshold=0.3)
+            
+            print(f"After overlap check: {len(boxes)} hands, handedness: {right}")
+            
+            # NOW check for bbox jumps and update tracking with VALID hands only
+            # This ensures we only track bboxes that survived filtering
+            img_width = img_cv2.shape[1]
+            print(f"\nFrame {img_fn}: Before jump check - boxes shape: {boxes.shape if isinstance(boxes, np.ndarray) else len(boxes)}")
+            for i, (bbox, hand_id) in enumerate(zip(boxes, right)):
+                if last_bbox_dict[hand_id] is not None:
+                    iou = compute_iou(bbox, last_bbox_dict[hand_id])
+                    print(f"  Hand {hand_id} ({'R' if hand_id else 'L'}): IoU with last frame = {iou:.3f}")
+                else:
+                    print(f"  Hand {hand_id} ({'R' if hand_id else 'L'}): First detection (no history)")
+            
+            boxes, jump_detected = check_bbox_jump(boxes, right, vit_keypoints, last_bbox_dict, img_width, iou_threshold=0.3)
+            boxes = np.array(boxes)  # Convert back to numpy array
+            
+            print(f"After bbox jump check: {len(boxes)} hands, handedness: {right}")
+            
+            # Visualize bboxes after filtering
+            img_debug = img_cv2.copy()
+            for i, bbox in enumerate(boxes):
+                x1, y1, x2, y2 = bbox
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                color = (0, 255, 0) if right[i] == 1 else (255, 0, 0)  # Green=right, Blue=left
+                cv2.rectangle(img_debug, (x1, y1), (x2, y2), color, 3)
+                label = f"{'R' if right[i] == 1 else 'L'}"
+                cv2.putText(img_debug, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+            cv2.imwrite(os.path.join(render_save_path, f'{img_fn}_bbox_after.jpg'), img_debug)
         else:
             raise ValueError
 
-        # if len(left_hand_keyp_list) > 0:
-        #     l_vit_keypoints = np.stack(left_hand_keyp_list)
-        # else:
-        #     l_vit_keypoints = np.zeros((1, 21, 3))
-        # if len(right_hand_keyp_list) > 0:
-        #     r_vit_keypoints = np.stack(right_hand_keyp_list)
-        # else:
-        #     r_vit_keypoints = np.zeros((1, 21, 3))
-        # print('raw vit results:', l_vit_keypoints.shape, r_vit_keypoints.shape)
-
         # Run reconstruction on all detected hands
-        print(right)
         assert (right == [0,1]).all() or (right == [0]).all() or (right == [1]).all()
 
         ####################################
 
-        # print(boxes.shape, right.shape, vit_keypoints.shape)
-        # raise ValueError
+        # print(f"Before restrict_hand_movement: {len(boxes)} hands, handedness: {right}")
         # boxes, right, vit_keypoints = restrict_hand_movement(boxes, right, vit_keypoints)
+        # print(f"After restrict_hand_movement: {len(boxes)} hands, handedness: {right}")
 
+        if len(boxes) == 0:
+            print("WARNING: All hands filtered out by restrict_hand_movement!")
+
+        print(f"Creating dataset with rescale_factor={args.rescale_factor}")
+        for i, bbox in enumerate(boxes):
+            x1, y1, x2, y2 = bbox
+            width = x2 - x1
+            height = y2 - y1
+            patch_size = args.rescale_factor * max(width, height)
+            print(f"  Hand {i} ({'right' if right[i] else 'left'}): bbox size={width:.0f}x{height:.0f}, patch size={patch_size:.0f}")
+        
         dataset = ViTDetDataset(model_cfg, img_cv2, boxes, right, vit_keypoints, rescale_factor=args.rescale_factor)
         dataloader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=False, num_workers=0)
 
@@ -708,6 +1082,7 @@ def main():
 
         left_flag = False
         right_flag = False
+        print(f"Starting HaMeR reconstruction with {len(boxes)} hands")
         b = time.time()
         print('vit time:', b-a)
         for batch in dataloader:
@@ -723,11 +1098,28 @@ def main():
             img_size = batch["img_size"].float()
             multiplier = (2*batch['right']-1)
             scaled_focal_length = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
-            # print(scaled_focal_length, model_cfg.EXTRA.FOCAL_LENGTH, model_cfg.MODEL.IMAGE_SIZE, img_size.max())
-            pred_cam_t_full = cam_crop_to_full(pred_cam, box_center, box_size, img_size, scaled_focal_length)#.detach().cpu().numpy()
-
-            # Render the result
+            
+            # Compute cam_trans using SLAHMR-style robust method
+            # This ensures depth (tz) is always positive and computed from bbox scale
             batch_size = batch['img'].shape[0]
+            pred_cam_t_full = torch.zeros(batch_size, 3, device=pred_cam.device)
+            for n in range(batch_size):
+                cam = pred_cam[n]  # (3,) - [scale, tx, ty] in normalized coords
+                H, W = img_size[n, 1], img_size[n, 0]  # height, width
+                focal = scaled_focal_length[n] if scaled_focal_length.ndim > 0 else scaled_focal_length
+                
+                cx, cy = box_center[n]  # bbox center
+                scale = box_size[n]  # bbox size
+                
+                # Compute depth from bbox scale (ensures positive depth)
+                tz = 2 * focal / (scale * cam[0] + 1e-6)
+                # Adjust translation based on bbox center offset from image center
+                tx = cam[1] + tz / focal * (cx - W / 2)
+                ty = cam[2] + tz / focal * (cy - H / 2)
+                
+                pred_cam_t_full[n] = torch.tensor([tx, ty, tz], device=pred_cam.device)
+            
+            print(f"[CAM_TRANS] Computed using SLAHMR method - Z range: [{pred_cam_t_full[:, 2].min():.3f}, {pred_cam_t_full[:, 2].max():.3f}]")
             # d3 = out['pred_keypoints_3d'].reshape(batch_size, -1, 3)
             # out['pred_keypoints_2d'] = perspective_projection(d3,
             #                             translation=pred_cam_t_full.reshape(batch_size, 3),
@@ -743,6 +1135,13 @@ def main():
                 white_img = (torch.ones_like(batch['img'][n]).cpu() - DEFAULT_MEAN[:,None,None]/255) / (DEFAULT_STD[:,None,None]/255)
                 input_patch = batch['img'][n].cpu() * (DEFAULT_STD[:,None,None]/255) + (DEFAULT_MEAN[:,None,None]/255)
                 input_patch = input_patch.permute(1,2,0).numpy()
+                
+                # Visualize the input patch fed to HaMeR
+                is_right = int(batch['right'][n].cpu().numpy())
+                patch_vis = (input_patch * 255).astype(np.uint8)
+                hand_label = 'right' if is_right == 1 else 'left'
+                patch_path = os.path.join(render_save_path, f'{img_fn}_patch_{hand_label}.jpg')
+                cv2.imwrite(patch_path, patch_vis[:, :, ::-1])  # Convert RGB to BGR for cv2
 
                 # Add all verts and cams to list
                 verts = out['pred_vertices'][n].detach().cpu().numpy()
@@ -750,31 +1149,20 @@ def main():
                 pred_3d = out['pred_keypoints_3d'][n].detach().cpu().numpy()
 
                 is_right = int(batch['right'][n].cpu().numpy())
-                if 'EgoPAT3D' == args.type and is_right == 0:
-                    print('stip left hand for EgoPAT3D')
-                    continue
-                # if 'HOI4D' == args.type and is_right == 0:
-                #     print('stip left hand for HOI4D')
-                #     continue
-                # if 'FPHA' == args.type and is_right == 0:
-                #     print('stip left hand for FPHA')
-                #     continue
-                if 'EgoDexter' == args.type and is_right == 1:
-                    print('skip right hand for EgoDexter')
-                    continue
-
-                # print("args.type: ", args.type, is_right)
-                # raise ValueError
 
                 if is_right == 1:
                     if not right_flag:
                         right_flag = True
+                        print(f"  → Adding RIGHT hand (first one)")
                     else:
+                        print(f"  → Skipping RIGHT hand (already have one)")
                         continue
                 else:
                     if not left_flag:
                         left_flag = True
+                        print(f"  → Adding LEFT hand (first one)")
                     else:
+                        print(f"  → Skipping LEFT hand (already have one)")
                         continue
 
                 pred_joints[:,0] = (2*is_right-1)*pred_joints[:,0]
@@ -809,6 +1197,10 @@ def main():
         big_all_verts.append(all_verts)
         big_all_cam_t.append(all_cam_t)
         big_all_right.append(all_right)
+
+        print(f"Finished HaMeR reconstruction: {len(all_verts)} hands reconstructed")
+        if len(all_verts) == 0:
+            print("WARNING: No hands were reconstructed by HaMeR!")
 
         assert len(results_dict[img_path]['tracked_ids']) <= 2
         if len(results_dict[img_path]['tracked_ids']) == 1:
@@ -909,8 +1301,8 @@ def main():
 
                 # draw 2d keypoints
                 cv2.imwrite(os.path.join(render_save_path, f'{img_fn}.jpg'), 255*input_img_overlay[:, :, ::-1])
-                cv2.imwrite(os.path.join(joint2d_save_path, f'{img_fn}.jpg'), pred_img[:, :, ::-1])
-                cv2.imwrite(os.path.join(vit_save_path, f'{img_fn}.jpg'), vit_img[:, :, ::-1])
+                cv2.imwrite(os.path.join(joint2d_save_path, f'{img_fn}.jpg'), pred_img)
+                cv2.imwrite(os.path.join(vit_save_path, f'{img_fn}.jpg'), vit_img)
 
         c = time.time()
         print('one step time: ', c - a, 'hamer time: ', c-b)
