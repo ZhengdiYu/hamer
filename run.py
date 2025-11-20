@@ -1104,7 +1104,7 @@ def clean_bbox_sequences(raw_data, vis_dir=None):
                     avg_width = (start_width + end_width) / 2
                     
                     # Only interpolate if bboxes are close enough (within 2× bbox width)
-                    max_distance = 2.0 * avg_width
+                    max_distance = avg_width
                     
                     if center_distance <= max_distance:
                         # Bboxes are close - INTERPOLATE
